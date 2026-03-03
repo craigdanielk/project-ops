@@ -3,25 +3,36 @@ name: Issue Closure Loop
 on:
   issues:
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      test_issue_title:
+        description: 'Test issue title'
+        default: 'Manual test'
+      test_issue_number:
+        description: 'Test issue number'
+        default: '0'
 
 jobs:
   notify-rag:
-    if: github.event.issue.state_reason == 'completed'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.issue.state_reason == 'completed'
     runs-on: ubuntu-latest
     steps:
       - name: POST to RAG
         env:
           RAG_URL: https://rag-mcp-server-rsc32eci6a-ew.a.run.app/mcp
           RAG_AUTH_TOKEN: ${{ secrets.RAG_AUTH_TOKEN }}
+          ISSUE_TITLE: ${{ github.event.issue.title || github.event.inputs.test_issue_title || 'Manual test' }}
+          ISSUE_NUM: ${{ github.event.issue.number || github.event.inputs.test_issue_number || '0' }}
+          ISSUE_LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
+          CLOSER: ${{ github.event.sender.login }}
+          REPO_NAME: ${{ github.repository }}
         run: |
-          REPO="${{ github.repository }}"
-          ISSUE_NUM="${{ github.event.issue.number }}"
-          ISSUE_TITLE="${{ github.event.issue.title }}"
-          LABELS=$(echo '${{ toJSON(github.event.issue.labels.*.name) }}' | jq -r 'join(", ")')
-          CLOSER="${{ github.event.sender.login }}"
-          SESSION_ID="github-issue-${REPO//\//-}-${ISSUE_NUM}"
+          LABELS=$(echo "$ISSUE_LABELS_JSON" | jq -r 'if type == "array" then join(", ") else "" end' 2>/dev/null || echo "")
+          SESSION_ID="github-issue-${REPO_NAME//\//-}-${ISSUE_NUM}"
 
-          MSG="Issue #${ISSUE_NUM} closed (completed) in ${REPO}. Title: ${ISSUE_TITLE}. Labels: ${LABELS}. Closed by: ${CLOSER}."
+          MSG="Issue #${ISSUE_NUM} closed (completed) in ${REPO_NAME}. Title: ${ISSUE_TITLE}. Labels: ${LABELS}. Closed by: ${CLOSER}."
 
           # Build auth header
           AUTH_HEADER=""
@@ -37,7 +48,7 @@ jobs:
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"knowledge-loop\",\"version\":\"1.0\"}},\"id\":1}" \
             > /dev/null
 
-          SESSION_HEADER=$(grep -i "mcp-session-id" /tmp/headers | tr -d '' | awk '{print $2}')
+          SESSION_HEADER=$(grep -i "mcp-session-id" /tmp/headers | tr -d '\r' | awk '{print $2}')
           echo "MCP Session: $SESSION_HEADER"
 
           # Step 2: Send initialized notification
@@ -53,7 +64,7 @@ jobs:
           PAYLOAD=$(jq -n \
             --arg sid "$SESSION_ID" \
             --arg msg "$MSG" \
-            --arg repo "$REPO" \
+            --arg repo "$REPO_NAME" \
             '{
               jsonrpc: "2.0",
               method: "tools/call",
