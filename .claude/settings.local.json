@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash:*)",
+      "Bash(chmod:*)",
+      "Bash(shellcheck:*)",
+      "Bash(git:*)",
+      "Bash(gh:*)",
+      "Bash(./init.sh:*)",
+      "Bash(./scan.sh:*)",
+      "Bash(./scripts/version.sh:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "Bash(diff:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(mkdir:*)",
+      "Bash(cp:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)",
+      "Bash(curl:*)",
+      "Bash(jq:*)",
+      "Bash(python3:*)",
+      "Bash(npx:*)"
+    ]
+  }
+}

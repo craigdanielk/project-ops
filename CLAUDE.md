@@ -58,6 +58,14 @@ project_operations_system/
 - Remote: https://github.com/craigdanielk/project-ops.git
 - Published as v1.0.0
 - No test suite yet; consider adding shellcheck/bats tests
+- **Monday MCP server stderr crash (diagnosed 2026-03-04):** The `@mondaydotcomorg/monday-api-mcp` server emits npm deprecation warnings on stderr during startup (`npm warn deprecated prebuild-install@7.1.3`). Claude Code's MCP client interprets any stderr output as a server crash, causing repeated restart attempts. The server itself starts and runs correctly -- this is a false positive. Workaround: pipe stderr to /dev/null in the MCP server config, or wait for the upstream `prebuild-install` dependency to be updated. See `mcp-configs/servers/monday.json` for the server definition.
+
+## CLI Auto-Permissions
+
+The `.claude/settings.local.json` file configures which tools Claude Code can
+run without prompting in this repo. Covers: shell scripts (init.sh, scan.sh,
+version.sh), git operations, GitHub CLI, shellcheck, file utilities, and
+common CLI tools (curl, jq, python3, npx).
 
 ## Current Status
 
