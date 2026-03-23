@@ -1,9 +1,13 @@
-# SOP Template: RAG Entity Sync
+# SOP Template: RAG Entity Sync (v2 — Streamable HTTP)
 # Copy to: .github/workflows/rag-entity-sync.yml
 # Purpose: On push to main when CLAUDE.md changes, parse it and upsert
 #          the corresponding RAG entity via memory_store_entity.
 # Auth: Requires RAG_AUTH_TOKEN secret (Bearer auth).
 # Target: knowledge_v2 collection, entity_type=repository.
+#
+# Protocol: MCP Streamable HTTP — POST JSON-RPC to /mcp, responses are
+#           SSE-framed (event: message\ndata: {json}). No session header
+#           is required by the RAG MCP server (stateless).
 
 name: RAG Entity Sync
 
@@ -27,8 +31,45 @@ jobs:
           RAG_AUTH_TOKEN: ${{ secrets.RAG_AUTH_TOKEN }}
           REPO_NAME: ${{ github.repository }}
         run: |
-          # Extract repo slug from github.repository (owner/repo → repo)
+          set -euo pipefail
+
+          # --- Helper: call MCP endpoint and parse SSE response ---
+          # Returns the JSON from the first "data:" line in the SSE stream.
+          mcp_call() {
+            local payload="$1"
+            local raw
+            raw=$(curl -s --max-time 30 -D /tmp/mcp_headers -X POST "$RAG_URL" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json, text/event-stream" \
+              -H "Authorization: Bearer $RAG_AUTH_TOKEN" \
+              ${SESSION_ID:+-H "Mcp-Session-Id: $SESSION_ID"} \
+              -d "$payload" 2>&1) || true
+
+            # If response is plain JSON (no SSE framing), return as-is
+            if echo "$raw" | head -1 | jq -e . >/dev/null 2>&1; then
+              echo "$raw"
+              return
+            fi
+
+            # Parse SSE: extract the first "data: " line
+            local json
+            json=$(echo "$raw" | grep '^data: ' | head -1 | sed 's/^data: //')
+            if [ -z "$json" ]; then
+              echo "RAW_RESPONSE: $raw" >&2
+              echo "{}"
+              return
+            fi
+            echo "$json"
+          }
+
+          # --- Setup ---
           REPO_SLUG=$(echo "$REPO_NAME" | awk -F/ '{print $NF}')
+          SESSION_ID=""
+
+          if [ -z "$RAG_AUTH_TOKEN" ]; then
+            echo "::error::RAG_AUTH_TOKEN secret is not set"
+            exit 1
+          fi
 
           # Read CLAUDE.md content (truncate to 8000 chars for entity description)
           if [ ! -f CLAUDE.md ]; then
@@ -37,40 +78,40 @@ jobs:
           fi
           CLAUDE_CONTENT=$(head -c 8000 CLAUDE.md)
 
-          AUTH_HEADER=""
-          if [ -n "$RAG_AUTH_TOKEN" ]; then
-            AUTH_HEADER="Authorization: Bearer $RAG_AUTH_TOKEN"
+          # --- Step 1: Initialize MCP session ---
+          echo "=== Initializing MCP session ==="
+          INIT_RESP=$(mcp_call '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"rag-entity-sync","version":"2.0"}},"id":1}')
+
+          # Check for successful init
+          if echo "$INIT_RESP" | jq -e '.result.serverInfo' >/dev/null 2>&1; then
+            SERVER_NAME=$(echo "$INIT_RESP" | jq -r '.result.serverInfo.name // "unknown"')
+            SERVER_VER=$(echo "$INIT_RESP" | jq -r '.result.serverInfo.version // "unknown"')
+            echo "Connected to $SERVER_NAME v$SERVER_VER"
+          else
+            echo "::warning::Unexpected init response: $INIT_RESP"
           fi
 
-          # Initialize MCP session
-          INIT_RESP=$(curl -sf -D /tmp/headers -X POST "$RAG_URL" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json, text/event-stream" \
-            ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-            -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"rag-entity-sync","version":"1.0"}},"id":1}' \
-            2>&1) || true
-
-          SESSION_HEADER=$(grep -i "mcp-session-id" /tmp/headers | tr -d '\r' | awk '{print $2}')
-          if [ -z "$SESSION_HEADER" ]; then
-            echo "Failed to initialize MCP session."
-            echo "Response: $INIT_RESP"
-            exit 1
+          # Capture session ID if server provides one (future-proofing)
+          SESSION_ID=$(grep -i "mcp-session-id" /tmp/mcp_headers 2>/dev/null | tr -d '\r' | awk '{print $2}') || true
+          if [ -n "$SESSION_ID" ]; then
+            echo "MCP Session: $SESSION_ID"
+          else
+            echo "No session ID returned (server is stateless) — continuing."
           fi
-          echo "MCP Session: $SESSION_HEADER"
 
-          # Send initialized notification
-          curl -sf -X POST "$RAG_URL" \
+          # --- Step 2: Send initialized notification ---
+          curl -s --max-time 10 -X POST "$RAG_URL" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json, text/event-stream" \
-            -H "Mcp-Session-Id: $SESSION_HEADER" \
-            ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+            -H "Authorization: Bearer $RAG_AUTH_TOKEN" \
+            ${SESSION_ID:+-H "Mcp-Session-Id: $SESSION_ID"} \
             -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-            > /dev/null
+            > /dev/null 2>&1 || true
 
-          # Build memory_store_entity payload
-          # Entity name = repo slug, entity_type = repository
-          # Description = full CLAUDE.md content (upsert-by-name deduplicates)
-          PAYLOAD=$(jq -n \
+          # --- Step 3: Sync repository entity ---
+          echo ""
+          echo "=== Syncing entity: $REPO_SLUG (type: repository) ==="
+          ENTITY_PAYLOAD=$(jq -n \
             --arg name "$REPO_SLUG" \
             --arg desc "$CLAUDE_CONTENT" \
             --arg repo "$REPO_NAME" \
@@ -91,22 +132,55 @@ jobs:
               id: 2
             }')
 
-          RESULT=$(curl -sf -X POST "$RAG_URL" \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json, text/event-stream" \
-            -H "Mcp-Session-Id: $SESSION_HEADER" \
-            ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
-            -d "$PAYLOAD" 2>&1) || true
+          RESULT=$(mcp_call "$ENTITY_PAYLOAD")
+          echo "Entity response: $RESULT"
 
-          echo "RAG Response: $RESULT"
+          # Validate result
+          if echo "$RESULT" | jq -e '.error' >/dev/null 2>&1; then
+            echo "::error::Entity sync failed: $(echo "$RESULT" | jq -r '.error.message // .error')"
+            exit 1
+          fi
+          if echo "$RESULT" | jq -e '.result.isError' >/dev/null 2>&1; then
+            IS_ERR=$(echo "$RESULT" | jq -r '.result.isError')
+            if [ "$IS_ERR" = "true" ]; then
+              echo "::error::Entity sync tool returned error"
+              exit 1
+            fi
+          fi
+          echo "Entity '$REPO_SLUG' synced."
 
-          # Check for errors
-          if echo "$RESULT" | grep -q '"isError":true'; then
-            echo "Entity sync failed."
-            exit 1
-          elif echo "$RESULT" | grep -q '"error"'; then
-            echo "Entity sync failed."
-            exit 1
+          # --- Step 4: Write heartbeat canary ---
+          echo ""
+          echo "=== Writing heartbeat canary ==="
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          CANARY_PAYLOAD=$(jq -n \
+            --arg name "sync-heartbeat::${REPO_SLUG}::${TIMESTAMP}" \
+            --arg desc "Heartbeat canary for $REPO_NAME at $TIMESTAMP. Workflow run: ${{ github.run_id }}" \
+            --arg repo "$REPO_NAME" \
+            '{
+              jsonrpc: "2.0",
+              method: "tools/call",
+              params: {
+                name: "memory_store_entity",
+                arguments: {
+                  input: {
+                    name: $name,
+                    entity_type: "heartbeat",
+                    description: $desc,
+                    related_projects: [($repo | split("/") | .[-1])]
+                  }
+                }
+              },
+              id: 3
+            }')
+
+          CANARY_RESULT=$(mcp_call "$CANARY_PAYLOAD")
+          echo "Heartbeat response: $CANARY_RESULT"
+
+          if echo "$CANARY_RESULT" | jq -e '.error' >/dev/null 2>&1; then
+            echo "::warning::Heartbeat canary failed (non-fatal)"
+          else
+            echo "Heartbeat written: sync-heartbeat::${REPO_SLUG}::${TIMESTAMP}"
           fi
 
           echo ""
